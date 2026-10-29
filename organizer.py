@@ -7,6 +7,9 @@ import json
 import stat
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
+
+from send2trash import send2trash
 
 
 def load_rules(path: Path) -> dict[str, list[str]]:
@@ -198,6 +201,11 @@ def undo_last_run(log_path: Path) -> RunResult:
     with open(log_path, encoding="utf-8") as f:
         log = json.load(f)
 
+    # Empties were removed after the moves, so they're restored first.
+    # The list is children-before-parents, so reversed() makes parents first.
+    for entry in reversed(log.get("removed", [])):
+        recreate_empty(Path(entry["path"]), entry["kind"], result)
+
     not_undone = []  # moves we couldn't reverse, kept so the user can retry
 
     for entry in reversed(log["moves"]):
@@ -232,3 +240,151 @@ def undo_last_run(log_path: Path) -> RunResult:
     else:
         log_path.unlink()  # fully undone, so there's nothing left to undo
     return result
+
+
+# ---------------------------------------------------------------------------
+# Cleaning: find empty files and folders, send them to the Recycle Bin
+# ---------------------------------------------------------------------------
+
+# Empty files that exist on purpose (tools rely on them), so never removed.
+KEEP_EMPTY_FILES = {".gitkeep", ".keep", "__init__.py", ".nojekyll"}
+
+# Windows attribute flags (numbers from the Windows API docs).
+# A file with any of these may LOOK empty but its content lives in the cloud
+# (e.g. OneDrive "online-only"), or it's a link to somewhere else.
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+FILE_ATTRIBUTE_OFFLINE = 0x1000
+FILE_ATTRIBUTE_RECALL_ON_OPEN = 0x40000
+FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS = 0x400000
+CLOUD_OR_LINK_FLAGS = (
+    FILE_ATTRIBUTE_REPARSE_POINT
+    | FILE_ATTRIBUTE_OFFLINE
+    | FILE_ATTRIBUTE_RECALL_ON_OPEN
+    | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+)
+
+
+def is_link_or_cloud(path: Path) -> bool:
+    """True for shortcuts-to-folders, junctions and cloud placeholders.
+
+    lstat() looks at the item itself, not what it points to.
+    """
+    if path.is_symlink():
+        return True
+    attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    return bool(attributes & CLOUD_OR_LINK_FLAGS)
+
+
+def is_removable_empty_file(path: Path) -> bool:
+    return (
+        path.stat().st_size == 0
+        and path.name.lower() not in KEEP_EMPTY_FILES
+    )
+
+
+def find_empties(folder: Path) -> list[Path]:
+    """Return empty files and empty folders inside `folder`, children first.
+
+    A folder counts as empty if everything in it is empty too, so a folder
+    holding only an empty subfolder is removed as well. `folder` itself is
+    never included. Project folders are not looked inside.
+    """
+    empties: list[Path] = []
+    _collect_empties(folder, empties)
+    return empties
+
+
+def _collect_empties(folder: Path, empties: list[Path]) -> bool:
+    """Add removable items under `folder` to `empties`.
+
+    Returns True if everything inside `folder` is removable, meaning the
+    folder will be empty once they're gone.
+    """
+    everything_removable = True
+
+    for path in sorted(folder.iterdir()):
+        if is_link_or_cloud(path) or is_hidden_or_system(path):
+            everything_removable = False  # never touch it, and it keeps the folder
+        elif path.is_dir():
+            if is_project_folder(path):
+                everything_removable = False
+            elif _collect_empties(path, empties):
+                empties.append(path)  # after its children: children first
+            else:
+                everything_removable = False
+        elif is_removable_empty_file(path):
+            empties.append(path)
+        else:
+            everything_removable = False
+
+    return everything_removable
+
+
+def clean_empties(
+    empties: list[Path],
+    log_path: Path,
+    trash: Callable[[str], None] = send2trash,
+) -> RunResult:
+    """Send each empty item to the Recycle Bin and add it to the undo log.
+
+    Call this AFTER apply_moves(): it adds to the same run's log, so one
+    Undo reverses the whole run. Each item is checked again right before
+    removal, in case something was added to it since the preview.
+    `trash` is swappable so tests don't touch the real Recycle Bin.
+    """
+    result = RunResult()
+    log = load_log(log_path)
+    log.setdefault("removed", [])
+
+    try:
+        for path in empties:
+            if not still_empty(path):
+                result.failed.append(f"{path.name}: skipped, it's no longer empty")
+                continue
+
+            kind = "folder" if path.is_dir() else "file"
+            try:
+                trash(str(path))
+            except OSError:
+                result.failed.append(f"{path.name}: couldn't remove it (it may be open in another app)")
+                continue
+
+            log["removed"].append({"path": str(path), "kind": kind})
+            result.done += 1
+    finally:
+        save_log(log, log_path)
+
+    return result
+
+
+def still_empty(path: Path) -> bool:
+    if not path.exists():
+        return False
+    if path.is_dir():
+        return not any(path.iterdir())
+    return is_removable_empty_file(path)
+
+
+def load_log(log_path: Path) -> dict:
+    if not log_path.exists():
+        return {"moves": [], "created_folders": []}
+    with open(log_path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def recreate_empty(path: Path, kind: str, result: RunResult) -> None:
+    """Undo for a removed empty item: an empty thing is easy to rebuild.
+
+    (The original also stays in the Recycle Bin, in case it's wanted.)
+    """
+    if path.exists():
+        return  # something is already there; leave it
+    try:
+        if kind == "folder":
+            path.mkdir(parents=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        result.done += 1
+    except OSError:
+        result.failed.append(f"{path.name}: couldn't recreate it")
