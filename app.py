@@ -259,5 +259,15 @@ class OrganizerApp(tk.Tk):
         )
 
 
+def enable_sharp_text_on_windows():
+    """Stop Windows from blurring the window on scaled (e.g. 125%) displays."""
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except (AttributeError, OSError):
+        pass  # not Windows, or an older Windows: the window still works
+
+
 if __name__ == "__main__":
+    enable_sharp_text_on_windows()
     OrganizerApp().mainloop()
