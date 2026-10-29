@@ -123,3 +123,112 @@ def plan_moves(folder: Path, rules: dict[str, list[str]]) -> list[Move]:
         moves.append(Move(source=path, destination=destination))
 
     return moves
+
+
+# ---------------------------------------------------------------------------
+# Applying: actually move the files, and record everything for undo
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RunResult:
+    """What happened during apply or undo, for the UI to show."""
+    done: int = 0
+    failed: list[str] = None  # friendly messages, one per file that failed
+
+    def __post_init__(self):
+        if self.failed is None:
+            self.failed = []
+
+
+def apply_moves(moves: list[Move], log_path: Path) -> RunResult:
+    """Move each file to its destination and write an undo log.
+
+    - Never overwrites: if the destination appeared since planning, skip it.
+    - One failed file (e.g. open in another app) doesn't stop the rest.
+    - The log is written even if something goes wrong halfway, so undo
+      always knows exactly what was moved.
+    """
+    result = RunResult()
+    log = {"moves": [], "created_folders": []}
+
+    try:
+        for move in moves:
+            parent = move.destination.parent
+            if not parent.exists():
+                parent.mkdir(parents=True)
+                log["created_folders"].append(str(parent))
+
+            if move.destination.exists():
+                result.failed.append(f"{move.source.name}: a file with that name is already there")
+                continue
+
+            try:
+                move.source.rename(move.destination)
+            except OSError:
+                result.failed.append(f"{move.source.name}: couldn't move it (it may be open in another app)")
+                continue
+
+            log["moves"].append({"source": str(move.source), "destination": str(move.destination)})
+            result.done += 1
+    finally:
+        save_log(log, log_path)
+
+    return result
+
+
+def save_log(log: dict, log_path: Path) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "w", encoding="utf-8") as f:
+        json.dump(log, f, indent=2)
+
+
+def undo_last_run(log_path: Path) -> RunResult:
+    """Put every file from the last run back where it was.
+
+    Moves are undone in reverse order. A file is only moved back if its
+    original spot is still free, so undo never overwrites anything either.
+    Folders the run created are removed only if they are empty again.
+    """
+    result = RunResult()
+
+    if not log_path.exists():
+        result.failed.append("There's nothing to undo yet.")
+        return result
+
+    with open(log_path, encoding="utf-8") as f:
+        log = json.load(f)
+
+    not_undone = []  # moves we couldn't reverse, kept so the user can retry
+
+    for entry in reversed(log["moves"]):
+        source = Path(entry["source"])
+        destination = Path(entry["destination"])
+
+        if not destination.exists():
+            # the user moved or deleted it since; nothing we can put back
+            result.failed.append(f"{destination.name}: it's no longer in {destination.parent.name}")
+            continue
+        if source.exists():
+            result.failed.append(f"{source.name}: another file now has its original name")
+            not_undone.append(entry)
+            continue
+
+        try:
+            destination.rename(source)
+            result.done += 1
+        except OSError:
+            result.failed.append(f"{destination.name}: couldn't move it back (it may be open in another app)")
+            not_undone.append(entry)
+
+    for folder in reversed(log["created_folders"]):
+        try:
+            Path(folder).rmdir()  # rmdir only works on empty folders, so this is safe
+        except OSError:
+            pass  # not empty (user added files) or already gone: leave it
+
+    if not_undone:
+        # keep a log of what's left, so pressing Undo again can retry
+        save_log({"moves": list(reversed(not_undone)), "created_folders": []}, log_path)
+    else:
+        log_path.unlink()  # fully undone, so there's nothing left to undo
+    return result
