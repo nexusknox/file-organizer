@@ -289,6 +289,8 @@ def find_empties(folder: Path) -> list[Path]:
     holding only an empty subfolder is removed as well. `folder` itself is
     never included. Project folders are not looked inside.
     """
+    if is_project_folder(folder):
+        return []
     empties: list[Path] = []
     _collect_empties(folder, empties)
     return empties
@@ -388,3 +390,47 @@ def recreate_empty(path: Path, kind: str, result: RunResult) -> None:
         result.done += 1
     except OSError:
         result.failed.append(f"{path.name}: couldn't recreate it")
+
+
+# ---------------------------------------------------------------------------
+# The whole plan, across all the folders the user ticked
+# ---------------------------------------------------------------------------
+
+# Folder names that belong to Windows or installed apps. Never organize them.
+SYSTEM_FOLDER_NAMES = {"windows", "program files", "program files (x86)", "programdata", "appdata"}
+
+
+def protected_reason(folder: Path) -> str | None:
+    """Return why a folder must not be organized, or None if it's fine."""
+    folder = folder.resolve()
+    if folder.parent == folder:
+        return "it's a whole drive"
+    if folder == Path.home().resolve():
+        return "it's your whole user folder (pick folders inside it instead)"
+    if any(part.lower() in SYSTEM_FOLDER_NAMES for part in folder.parts):
+        return "it belongs to Windows or an installed app"
+    return None
+
+
+@dataclass
+class Plan:
+    moves: list[Move]
+    empties: list[Path]
+
+
+def build_plan(folders: list[Path], rules: dict[str, list[str]], clean_empty: bool) -> Plan:
+    """Plan moves (and optionally empty-item cleanup) for every folder.
+
+    An empty file would otherwise be both moved AND removed, so when
+    cleaning is on, empty files are removed rather than sorted.
+    """
+    moves: list[Move] = []
+    empties: list[Path] = []
+
+    for folder in folders:
+        folder_empties = find_empties(folder) if clean_empty else []
+        removing = set(folder_empties)
+        moves += [m for m in plan_moves(folder, rules) if m.source not in removing]
+        empties += folder_empties
+
+    return Plan(moves=moves, empties=empties)
