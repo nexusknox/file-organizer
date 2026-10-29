@@ -8,7 +8,13 @@ and can undo the last run with one click.
 It's built to be **safe on a real PC**: it never overwrites, never permanently
 deletes, and refuses to touch system folders or code projects.
 
+**Preview**: every planned change is listed before anything happens:
+
 ![Preview of planned changes](docs/screenshots/preview_before.png)
+
+**After organizing**:
+
+![After organizing](docs/screenshots/preview_after.png)
 
 ## Features
 
@@ -86,7 +92,7 @@ Download `FileOrganizer.exe` from the [Releases](../../releases) page and double
 
 ### Run from source (PowerShell)
 ```powershell
-git clone https://github.com/ivanedens55-web/file-organizer.git
+git clone https://github.com/nexusknox/file-organizer.git
 cd file-organizer
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
